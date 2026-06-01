@@ -207,9 +207,9 @@ class CosyVoice3(CosyVoice2):
 
         # match model's training context length
         self.llm_n_ctx = 32768
-        # standard llama params
-        self.llm_temperature = 0.8
-        self.llm_top_p = 0.95
+        # params from cosyvoice3.yml
+        self.llm_temperature = 1.0
+        self.llm_top_p = 0.8
         self.llm_top_k = 25
 
         if load_llama_cpp and not gguf_model_path:
@@ -289,6 +289,9 @@ class CosyVoice3(CosyVoice2):
             temperature=self.llm_temperature,
             top_p=self.llm_top_p,
             top_k=self.llm_top_k,
+            repeat_penalty=1.3,
+            frequency_penalty=0.0,
+            presence_penalty=0.0
         )
 
         self.sos_token_id = self.speech_token_offset + self.sos_speech_idx
