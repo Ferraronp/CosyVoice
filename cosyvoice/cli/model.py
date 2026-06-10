@@ -468,19 +468,22 @@ class CosyVoice3Model(CosyVoice2Model):
             self.hift_cache_dict[this_uuid] = None
 
         tokens_gpu = torch.tensor(tokens, dtype=torch.int32, device=self.device).unsqueeze(0)
-        tts_speech = self.token2wav(
-            token=tokens_gpu,
-            prompt_token=flow_prompt_speech_token,
-            prompt_feat=prompt_speech_feat,
-            embedding=flow_embedding,
-            token_offset=0,
-            uuid=this_uuid,
-            finalize=True,
-            speed=speed,
-        )
-
-        with self.lock:
-            self.hift_cache_dict.pop(this_uuid)
+        try:
+            tts_speech = self.token2wav(
+                token=tokens_gpu,
+                prompt_token=flow_prompt_speech_token,
+                prompt_feat=prompt_speech_feat,
+                embedding=flow_embedding,
+                token_offset=0,
+                uuid=this_uuid,
+                finalize=True,
+                speed=speed,
+            )
+        finally:
+            # pop в finally: иначе исключение в token2wav навсегда оставляет
+            # запись в hift_cache_dict (утечка памяти между запросами)
+            with self.lock:
+                self.hift_cache_dict.pop(this_uuid, None)
         return {'tts_speech': tts_speech.cpu()}
 
     def tts_stream_external_llm(
@@ -488,12 +491,19 @@ class CosyVoice3Model(CosyVoice2Model):
         tokens_list,
         tokens_lock,
         llm_end_flag,
+        tokens_cond=None,
         flow_embedding=torch.zeros(0, 192),
         flow_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
         prompt_speech_feat=torch.zeros(1, 0, 80),
         **kwargs
     ):
-        """Streaming TTS with external LLM providing tokens via shared list + lock."""
+        """Streaming TTS with external LLM providing tokens via shared list + lock.
+
+        tokens_cond: optional threading.Condition built on tokens_lock. If given,
+        the consumer wakes up immediately when the producer appends a token
+        instead of polling with a fixed 0.1s sleep (which added up to 100ms of
+        latency per chunk).
+        """
         this_uuid = str(uuid.uuid1())
         with self.lock:
             self.hift_cache_dict[this_uuid] = None
@@ -505,36 +515,52 @@ class CosyVoice3Model(CosyVoice2Model):
             - flow_prompt_speech_token.shape[1]
         )
 
+        # Condition и Lock делят один и тот же примитив, поэтому контекстный
+        # менеджер у обоих захватывает tokens_lock
+        sync = tokens_cond if tokens_cond is not None else tokens_lock
+
         try:
             while True:
-                time.sleep(0.1)
                 this_token_hop_len = (
                     self.token_hop_len + prompt_token_pad if token_offset == 0
                     else self.token_hop_len
                 )
-                with tokens_lock:
-                    available = len(tokens_list) - token_offset
-                    need = this_token_hop_len + self.flow.pre_lookahead_len
+                need = this_token_hop_len + self.flow.pre_lookahead_len
 
-                if available >= need:
-                    with tokens_lock:
+                with sync:
+                    # Ждём пока наберётся need токенов или продюсер закончит.
+                    # done и available читаются под одним локом — нет гонки
+                    # со «протухшим» available из прошлой итерации.
+                    while (len(tokens_list) - token_offset) < need and not llm_end_flag['done']:
+                        if tokens_cond is not None:
+                            tokens_cond.wait(timeout=0.5)
+                        else:
+                            tokens_lock.release()
+                            try:
+                                time.sleep(0.02)
+                            finally:
+                                tokens_lock.acquire()
+                    if (len(tokens_list) - token_offset) >= need:
                         batch = list(tokens_list[:token_offset + need])
-                    this_tts_speech_token = torch.tensor(batch).unsqueeze(0)
-                    tts_speech = self.token2wav(
-                        token=this_tts_speech_token,
-                        prompt_token=flow_prompt_speech_token,
-                        prompt_feat=prompt_speech_feat,
-                        embedding=flow_embedding,
-                        token_offset=token_offset,
-                        uuid=this_uuid,
-                        stream=True,
-                        finalize=False,
-                    )
-                    token_offset += this_token_hop_len
-                    yield {'tts_speech': tts_speech.cpu()}
+                    else:
+                        batch = None  # done, остаток уйдёт финальным чанком
 
-                if llm_end_flag['done'] and available < need:
+                if batch is None:
                     break
+
+                this_tts_speech_token = torch.tensor(batch).unsqueeze(0)
+                tts_speech = self.token2wav(
+                    token=this_tts_speech_token,
+                    prompt_token=flow_prompt_speech_token,
+                    prompt_feat=prompt_speech_feat,
+                    embedding=flow_embedding,
+                    token_offset=token_offset,
+                    uuid=this_uuid,
+                    stream=True,
+                    finalize=False,
+                )
+                token_offset += this_token_hop_len
+                yield {'tts_speech': tts_speech.cpu()}
 
             # Final batch
             with tokens_lock:
