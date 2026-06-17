@@ -389,7 +389,13 @@ class CosyVoice3(CosyVoice2):
 
                 # Use built-in sample() (position-aware, like FastCosyVoice)
                 next_token_id = self.llm_gguf.sample()
+                REPEAT_PENALTY_WINDOW = 10
 
+                if speech_tokens:
+                    recent = speech_tokens[-REPEAT_PENALTY_WINDOW:]
+                    count = recent.count(next_token_id - self.speech_token_offset)
+                    if count >= 4:
+                        next_token_id = self._sample_speech_token_constrained(logit_pos=n_past - 1)
                 # If built-in sample returns text token, retry with constrained sampling
                 if (next_token_id != self.eos_token_id and
                     not (self.speech_token_offset <= next_token_id < self.speech_token_offset + self.base_speech_token_size)):
